@@ -15,6 +15,9 @@ build/
 dist/
 packages/*/lib/
 
+# Copied out of node_modules by scripts/vendor-vivari.mjs and build-v86.mjs.
+public/assets/
+
 # Copied out of node_modules by scripts/build-v86.mjs; the BIOS beside them is vendored.
 public/v86/*.wasm
 
