@@ -1,0 +1,13 @@
+# The LAN scanner, as a profile bundle layer.
+#
+# A page cannot enumerate a network — there is no ARP table, no ICMP, no DHCP
+# lease list, and no multicast. What it does have is `fetch`, which is a TCP
+# connection, so the only discovery available to a page is unicast probing: try
+# every address, and keep the ones that answer.
+#
+# That is a client-side capability with no host-side work to do, so the node
+# half is a row that exists only to carry the browser half into the roster —
+# same shape as the star plugin.
+- insert:
+    - id: web-lanscan
+      name: '@dsh-web/lanscan'

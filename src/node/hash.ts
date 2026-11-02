@@ -1,5 +1,5 @@
 /**
- * Synchronous SHA-1, SHA-256 and MD5 for the `node:crypto` shim.
+ * Synchronous SHA-1, SHA-256, SHA-512 and MD5 for the `node:crypto` shim.
  *
  * WebCrypto's `subtle.digest` is async, but `createHash(...).update(...).digest()`
  * is synchronous by contract and dsh hashes bundle content and session ids on
@@ -133,11 +133,100 @@ export function md5(input: Uint8Array): Uint8Array {
   return out
 }
 
+
+/** Append SHA-512's 128-bit big-endian length padding, block size 128. */
+function padBigEndian128(bytes: Uint8Array): Uint8Array {
+  const bitLength = BigInt(bytes.length) * 8n
+  const padded = new Uint8Array(((bytes.length + 17 + 127) >> 7) << 7)
+  padded.set(bytes)
+  padded[bytes.length] = 0x80
+  const view = new DataView(padded.buffer)
+  // A byte count that fits in 64 bits covers every input this page can hold;
+  // the high 64 bits of the 128-bit field are therefore written as zero.
+  view.setBigUint64(padded.length - 8, bitLength)
+  return padded
+}
+
+/** SHA-512 round constants (FIPS 180-4 §4.2.3). */
+const K512 = [
+  0x428a2f98d728ae22n, 0x7137449123ef65cdn, 0xb5c0fbcfec4d3b2fn, 0xe9b5dba58189dbbcn,
+  0x3956c25bf348b538n, 0x59f111f1b605d019n, 0x923f82a4af194f9bn, 0xab1c5ed5da6d8118n,
+  0xd807aa98a3030242n, 0x12835b0145706fben, 0x243185be4ee4b28cn, 0x550c7dc3d5ffb4e2n,
+  0x72be5d74f27b896fn, 0x80deb1fe3b1696b1n, 0x9bdc06a725c71235n, 0xc19bf174cf692694n,
+  0xe49b69c19ef14ad2n, 0xefbe4786384f25e3n, 0x0fc19dc68b8cd5b5n, 0x240ca1cc77ac9c65n,
+  0x2de92c6f592b0275n, 0x4a7484aa6ea6e483n, 0x5cb0a9dcbd41fbd4n, 0x76f988da831153b5n,
+  0x983e5152ee66dfabn, 0xa831c66d2db43210n, 0xb00327c898fb213fn, 0xbf597fc7beef0ee4n,
+  0xc6e00bf33da88fc2n, 0xd5a79147930aa725n, 0x06ca6351e003826fn, 0x142929670a0e6e70n,
+  0x27b70a8546d22ffcn, 0x2e1b21385c26c926n, 0x4d2c6dfc5ac42aedn, 0x53380d139d95b3dfn,
+  0x650a73548baf63den, 0x766a0abb3c77b2a8n, 0x81c2c92e47edaee6n, 0x92722c851482353bn,
+  0xa2bfe8a14cf10364n, 0xa81a664bbc423001n, 0xc24b8b70d0f89791n, 0xc76c51a30654be30n,
+  0xd192e819d6ef5218n, 0xd69906245565a910n, 0xf40e35855771202an, 0x106aa07032bbd1b8n,
+  0x19a4c116b8d2d0c8n, 0x1e376c085141ab53n, 0x2748774cdf8eeb99n, 0x34b0bcb5e19b48a8n,
+  0x391c0cb3c5c95a63n, 0x4ed8aa4ae3418acbn, 0x5b9cca4f7763e373n, 0x682e6ff3d6b2b8a3n,
+  0x748f82ee5defb2fcn, 0x78a5636f43172f60n, 0x84c87814a1f0ab72n, 0x8cc702081a6439ecn,
+  0x90befffa23631e28n, 0xa4506cebde82bde9n, 0xbef9a3f7b2c67915n, 0xc67178f2e372532bn,
+  0xca273eceea26619cn, 0xd186b8c721c0c207n, 0xeada7dd6cde0eb1en, 0xf57d4f7fee6ed178n,
+  0x06f067aa72176fban, 0x0a637dc5a2c898a6n, 0x113f9804bef90daen, 0x1b710b35131c471bn,
+  0x28db77f523047d84n, 0x32caab7b40c72493n, 0x3c9ebe0a15c9bebcn, 0x431d67c49c100d4cn,
+  0x4cc5d4becb3e42b6n, 0x597f299cfc657e2an, 0x5fcb6fab3ad6faecn, 0x6c44198c4a475817n,
+]
+
+/** Mask to 64 bits, the width SHA-512 works in. */
+const MASK64 = 0xffffffffffffffffn
+
+/** Rotate a 64-bit word right. */
+function rotr64(value: bigint, bits: bigint): bigint {
+  return ((value >> bits) | (value << (64n - bits))) & MASK64
+}
+
+/**
+ * SHA-512 over the whole input.
+ *
+ * 64-bit words, so the arithmetic is BigInt: a page cannot do this in 32-bit
+ * halves without more code than the digest is worth. Needed because npm
+ * publishes `dist.integrity` as `sha512-…` and the plugin installer verifies
+ * it with `createHash('sha512')`, which is synchronous by contract.
+ */
+export function sha512(input: Uint8Array): Uint8Array {
+  const padded = padBigEndian128(input)
+  const view = new DataView(padded.buffer)
+  const h = [
+    0x6a09e667f3bcc908n, 0xbb67ae8584caa73bn, 0x3c6ef372fe94f82bn, 0xa54ff53a5f1d36f1n,
+    0x510e527fade682d1n, 0x9b05688c2b3e6c1fn, 0x1f83d9abfb41bd6bn, 0x5be0cd19137e2179n,
+  ]
+  const w = new Array<bigint>(80).fill(0n)
+  for (let offset = 0; offset < padded.length; offset += 128) {
+    for (let i = 0; i < 16; i++) w[i] = view.getBigUint64(offset + i * 8)
+    for (let i = 16; i < 80; i++) {
+      const s0 = rotr64(w[i - 15], 1n) ^ rotr64(w[i - 15], 8n) ^ (w[i - 15] >> 7n)
+      const s1 = rotr64(w[i - 2], 19n) ^ rotr64(w[i - 2], 61n) ^ (w[i - 2] >> 6n)
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) & MASK64
+    }
+    let [a, b, c, d, e, f, g, hh] = h
+    for (let i = 0; i < 80; i++) {
+      const S1 = rotr64(e, 14n) ^ rotr64(e, 18n) ^ rotr64(e, 41n)
+      const ch = (e & f) ^ (~e & g & MASK64)
+      const temp1 = (hh + S1 + ch + K512[i] + w[i]) & MASK64
+      const S0 = rotr64(a, 28n) ^ rotr64(a, 34n) ^ rotr64(a, 39n)
+      const maj = (a & b) ^ (a & c) ^ (b & c)
+      const temp2 = (S0 + maj) & MASK64
+      hh = g; g = f; f = e; e = (d + temp1) & MASK64; d = c; c = b; b = a; a = (temp1 + temp2) & MASK64
+    }
+    h[0] = (h[0] + a) & MASK64; h[1] = (h[1] + b) & MASK64; h[2] = (h[2] + c) & MASK64; h[3] = (h[3] + d) & MASK64
+    h[4] = (h[4] + e) & MASK64; h[5] = (h[5] + f) & MASK64; h[6] = (h[6] + g) & MASK64; h[7] = (h[7] + hh) & MASK64
+  }
+  const out = new Uint8Array(64)
+  const outView = new DataView(out.buffer)
+  for (let i = 0; i < 8; i++) outView.setBigUint64(i * 8, h[i])
+  return out
+}
+
 /** Dispatch by Node algorithm name; unknown names throw the way Node does. */
 export function digest(algorithm: string, input: Uint8Array): Uint8Array {
   const name = algorithm.toLowerCase().replace('-', '')
   if (name === 'sha1') return sha1(input)
   if (name === 'sha256') return sha256(input)
+  if (name === 'sha512') return sha512(input)
   if (name === 'md5') return md5(input)
   throw new Error(`Digest method not supported: ${algorithm}`)
 }
