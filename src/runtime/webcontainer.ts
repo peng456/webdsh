@@ -21,9 +21,10 @@
  *   that needs it shares a single promise.
  */
 
-import type { WebContainer, WebContainerProcess } from '@webcontainer/api'
-import { persistWorkspace, restoreWorkspace, type RuntimePersistence } from './persist.ts'
-import { installPython, persistPython, pythonBin, restorePython, type PythonPersistence } from './python.ts'
+import type { RuntimeHandle as WebContainer, RuntimeProcess as WebContainerProcess } from './vivari.ts'
+import type { RuntimePersistence } from './persist.ts'
+import type { PythonPersistence } from './python.ts'
+import { pythonBin } from './python.ts'
 import { CONTAINER_SHELL } from '../generated/container-shell.ts'
 import { CONTAINER_NET } from '../generated/container-net.ts'
 import { proxyConfig } from '../net/cors-proxy.ts'
@@ -64,6 +65,9 @@ export const HARNESS_DIR = '.dsh'
 /** The same, under the name the rest of this file uses. */
 const PRIVATE_DIR = HARNESS_DIR
 
+/** The harness's own directory, as the engine names it: absolute, not a prefix. */
+const STAGING = `${WORKDIR}/${PRIVATE_DIR}`
+
 /**
  * The environment a command runs in, with the harness's programs reachable.
  *
@@ -85,11 +89,14 @@ function environment(
   // The container's own `HOME` is `/home`, one level above the working
   // directory, so `~` and `cd` with no argument would land somewhere the user
   // has nothing. The page reports the same home, and the two must agree.
-  const env: Record<string, string> = { HOME: WORKDIR, PATH: runtime.path }
+  const env: Record<string, string> = { HOME: WORKDIR }
+  if (runtime.path !== '') env.PATH = runtime.path
   for (const [name, value] of Object.entries(requested)) {
     if (value !== undefined) env[name] = value
   }
-  env.PATH = `${WORKDIR}/${pythonBin()}:${env.PATH}`
+  // The engine keeps its own `PATH` when this build does not state one; a
+  // prefix written against nothing is how `npm` stops resolving.
+  if (env.PATH !== undefined) env.PATH = `${WORKDIR}/${pythonBin()}:${env.PATH}`
   return { ...env, ...networkEnvironment() }
 }
 
@@ -152,7 +159,10 @@ export type ShellMode = 'harness' | 'jsh'
  * correct: `setShellMode('harness')` puts the bundled POSIX shell back for
  * anyone who would rather have it.
  */
-let mode: ShellMode = 'jsh'
+// `harness`: this engine has no `jsh` binary to hand a script to — that shell
+// was the previous container's own — and the interpreter in `src/shell/` is
+// written to run on `node`, which this engine provides for real.
+let mode: ShellMode = 'harness'
 
 /** Which interpreter commands are currently handed to. */
 export function shellMode(): ShellMode {
@@ -186,12 +196,11 @@ export function setShellMode(next: ShellMode): void {
  */
 async function installPrograms(runtime: WebContainer): Promise<void> {
   await ensureStaging(runtime)
-  await runtime.fs.writeFile(`${PRIVATE_DIR}/sh.cjs`, CONTAINER_SHELL)
+  await runtime.fs.writeFile(`${STAGING}/sh.cjs`, CONTAINER_SHELL)
   // Beside the shell, and for the same reason it is written rather than
   // fetched: a preload that fails to arrive is every command in the session
   // failing to start, because `--require` names it in the environment.
-  await runtime.fs.writeFile(`${PRIVATE_DIR}/net.cjs`, CONTAINER_NET)
-  await installPython(runtime)
+  await runtime.fs.writeFile(`${STAGING}/net.cjs`, CONTAINER_NET)
 }
 
 /**
@@ -210,7 +219,7 @@ async function installPrograms(runtime: WebContainer): Promise<void> {
  * @param runtime - the booted container.
  */
 async function ensureStaging(runtime: WebContainer): Promise<void> {
-  await runtime.fs.mkdir(PRIVATE_DIR, { recursive: true })
+  await runtime.fs.mkdir(STAGING, { recursive: true })
   await runtime.fs.mkdir(toContainerPath(WORKSPACE), { recursive: true })
 }
 
@@ -226,9 +235,10 @@ async function ensureStaging(runtime: WebContainer): Promise<void> {
  * @returns the path as the container names it.
  */
 export function toContainerPath(absolute: string): string {
-  if (absolute === WORKDIR) return '.'
-  if (absolute.startsWith(`${WORKDIR}/`)) return absolute.slice(WORKDIR.length + 1) || '.'
-  return absolute.replace(/^\/+/, '')
+  // This engine's root *is* the filesystem root, so an absolute path is already
+  // what it accepts; the previous engine resolved everything against a session
+  // working directory and needed the prefix stripped.
+  return absolute
 }
 
 /**
@@ -378,33 +388,19 @@ export async function bootRuntime(onProgress?: (step: string) => void): Promise<
     if (!support.ok) throw new Error(`the runtime cannot start: ${support.reason ?? 'unsupported'}`)
 
     onProgress?.('Loading the runtime')
-    const { WebContainer: Runtime } = await import('@webcontainer/api')
+    const { bootVivari } = await import('./vivari.ts')
 
     onProgress?.('Starting Node')
-    const booted = await Runtime.boot({ workdirName: 'dsh' })
+    const booted = await bootVivari()
 
     onProgress?.('Preparing the workspace')
-    // The runtime's filesystem is in memory, so without this a reload loses the
-    // user's work — which is not a limitation to accept in a harness.
-    const restored = await restoreWorkspace(booted)
-    if (restored) onProgress?.('Restored your workspace')
-    // A mount writes a tree into the container, and a snapshot taken by an
-    // older layout can carry the whole working directory rather than the
-    // workspace inside it. Re-asserting costs two idempotent calls and covers
-    // the case where the first command would otherwise have nowhere to stage.
+    // No snapshot round trip here: this engine's filesystem is persisted to
+    // OPFS by the engine itself, so the workspace a session left behind is
+    // already the one it finds. The staging directories are still asserted,
+    // because a `rm -rf ~` inside the machine takes them too.
     await ensureStaging(booted)
-    // After the mount, never before it: a snapshot is written over the whole
-    // working directory, so a shell installed first is a shell the restore
-    // deletes. Python's own interpreter comes back the same way, from its own
-    // record, so a returning visitor does not download it twice.
-    // Bounded on its own, because it happens inside the boot deadline: a stored
-    // interpreter is tens of megabytes, and a slow read of it must cost the
-    // first `python3` a download rather than cost the page its container.
-    if (await withinBudget(restorePython(booted), RESTORE_BUDGET_MS)) onProgress?.('Restored Python')
-    onProgress?.('Installing the shell and Python')
+    onProgress?.('Installing the shell')
     await installPrograms(booted)
-    durability = persistWorkspace(booted)
-    pythonDurability = persistPython(booted)
     ready = true
     return booted
   })()).catch((error: unknown) => {
@@ -490,7 +486,7 @@ export async function execute(script: string, options: RunOptions = {}): Promise
   // passed as an argument arrives subtly different from the one the agent wrote
   // — `sed 's/a/\n/'` loses its escape and the command quietly does the wrong
   // thing. A file's bytes survive intact.
-  const scriptFile = `${PRIVATE_DIR}/run-${String(runCounter++)}.sh`
+  const scriptFile = `${STAGING}/run-${String(runCounter++)}.sh`
   try {
     await runtime.fs.writeFile(scriptFile, script)
   } catch {
@@ -513,8 +509,8 @@ export async function execute(script: string, options: RunOptions = {}): Promise
   // returns. It takes no positional parameters, which is one of the things the
   // plugin's tool description says out loud.
   const argv = mode === 'jsh'
-    ? ['jsh', [`${WORKDIR}/${scriptFile}`]] as const
-    : ['node', [SHELL_PATH, `${WORKDIR}/${scriptFile}`, ...positional]] as const
+    ? ['jsh', [scriptFile]] as const
+    : ['node', [SHELL_PATH, scriptFile, ...positional]] as const
   // A workspace the user picked exists wherever they made it, and the container
   // only has what someone put there. Creating it on the way in is what keeps
   // "the agent and the terminal are one machine" true for a workspace that is

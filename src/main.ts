@@ -16,9 +16,7 @@ import { bootHost } from './host/boot.ts'
 import { installModuleLoader } from './host/module-loader.ts'
 import { disableAllPlugins, installedPluginNames, installPluginManager } from './plugins/manager.ts'
 import { installWindowApi } from './api.ts'
-import { bootRuntime, runtimeSupported } from './runtime/webcontainer.ts'
-import { bootMachine } from './runtime/v86.ts'
-import { isBrowser, isEmulated } from './runtime/selection.ts'
+import { isBrowser } from './runtime/selection.ts'
 import { browserMachine } from './browser/engine.ts'
 import {
   publishFilesBridge, publishInstallerBridge, publishMachineBridge, publishNetworkBridge, publishRuntimeBridge,
@@ -152,9 +150,15 @@ async function main(): Promise<void> {
     // and an IndexedDB open, no download and nothing to boot — so it is
     // started here too, and for the third reason as well: the panel should be
     // able to draw a tab strip before the agent has opened anything.
+    // StackBlitz's headless frame is a *service*, not an asset this build can
+    // vendor: booting it is a request to `stackblitz.com/headless`, and every
+    // page load paid for it even when the user never ran a command — on this
+    // deployment's network that request also 404s, then times out 30s later.
+    // `src/host/bridges.ts` boots whichever machine a command needs, so the
+    // Node container and an emulated PC are now started on first use. The
+    // browser machine stays eager: a frame host and an IndexedDB open, no
+    // download, and its panel draws a tab strip before anything is opened.
     if (isBrowser()) void browserMachine().open().catch(() => undefined)
-    else if (isEmulated()) void bootMachine().catch(() => undefined)
-    else if (runtimeSupported().ok) void bootRuntime().catch(() => undefined)
 
     progress.step('Loading the web client')
     injectStyles()

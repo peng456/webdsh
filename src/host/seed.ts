@@ -8,10 +8,10 @@
  * visitor keeps their sessions, settings, and files.
  */
 
-import { SEED_FILES } from '../generated/seed-files.ts'
+import { SEED_FILES, SEED_REVISION } from '../generated/seed-files.ts'
 import { MODEL_CATALOG_PATCH } from '../generated/model-catalog.ts'
 import { volume } from '../vfs/volume.ts'
-import { toBytes } from '../node/binary.ts'
+import { toBytes, toText } from '../node/binary.ts'
 import { env } from '../node/process.ts'
 import browserPatchSource from './browser.patch.yml?raw'
 import machinePatchSource from '../../packages/dsh-web-machine/cordis.patch.yml?raw'
@@ -19,7 +19,9 @@ import installPatchSource from '../../packages/dsh-web-plugins/cordis.patch.yml?
 import starPatchSource from '../../packages/dsh-web-star/cordis.patch.yml?raw'
 import networkPatchSource from '../../packages/dsh-web-network/cordis.patch.yml?raw'
 import filesPatchSource from '../../packages/dsh-web-files/cordis.patch.yml?raw'
+import lanscanPatchSource from '../../packages/dsh-web-lanscan/cordis.patch.yml?raw'
 import { selectedGuest } from '../runtime/selection.ts'
+import { declareProfileDirectory, seedDefaultMarket } from '../plugins/default-market.ts'
 
 /**
  * Bundle layers for the plugins this repository ships.
@@ -34,6 +36,7 @@ const SHIPPED_PLUGIN_PATCHES: Record<string, string> = {
   'web-star': starPatchSource,
   'web-network': networkPatchSource,
   'web-files': filesPatchSource,
+  'web-lanscan': lanscanPatchSource,
 }
 
 /** The bundle layers this build lays down, in application order. */
@@ -41,6 +44,15 @@ export const SHIPPED_BUNDLES = ['browser', ...Object.keys(SHIPPED_PLUGIN_PATCHES
 
 /** Root the build's own files live under. */
 export const DEPLOY_ROOT = '/opt/dsh'
+
+/**
+ * Marks a seed row whose contents are base64 rather than UTF-8 text.
+ *
+ * The seed table is a list of strings, and the vendored market's files are JS
+ * bundles whose bytes do not survive a UTF-8 round-trip. `scripts/assemble.ts`
+ * writes those rows with this prefix.
+ */
+const BINARY_PREFIX = 'b64:'
 
 /**
  * Where the user's files live.
@@ -68,11 +80,30 @@ const SKELETON = [
  */
 const SHELL_STUBS = ['sh', 'bash', 'env', 'node', 'git']
 
-/** Files that belong to the build and are refreshed on every boot. */
+/** Marker recording which build's seed table the filesystem already carries. */
+const SEED_MARKER = `${DEPLOY_ROOT}/.seed-revision`
+
+/**
+ * Files that belong to the build and are refreshed when the build changes.
+ *
+ * The whole table used to be written on every boot. That is correct but not
+ * free: this deployment's table includes the vendored market, so each open
+ * decoded ~10 MB of base64 and wrote 1092 files into the virtual filesystem.
+ * The marker makes the refresh conditional on the table actually differing,
+ * which is the same guarantee for a user who changed nothing and far less work.
+ */
 function writeDeploymentFiles(): void {
-  for (const [path, contents] of SEED_FILES) {
-    volume.mkdirp(path.slice(0, path.lastIndexOf('/')))
-    volume.writeFile(path, toBytes(contents))
+  const stale = !volume.exists(SEED_MARKER) || toText(volume.readFile(SEED_MARKER)).trim() !== SEED_REVISION
+  if (stale) {
+    for (const [path, contents] of SEED_FILES) {
+      volume.mkdirp(path.slice(0, path.lastIndexOf('/')))
+      // A `b64:` row is a binary file (the vendored market's bundles); every
+      // other row is text and is written as UTF-8. The prefix is the build's, not
+      // a plugin's, so it is checked before anything is decoded.
+      volume.writeFile(path, contents.startsWith(BINARY_PREFIX)
+        ? toBytes(contents.slice(BINARY_PREFIX.length), 'base64')
+        : toBytes(contents))
+    }
   }
   // This deployment's own overlay layer, alongside the upstream bundle patches.
   // The authored rows first, then the generated provider roster: one layer,
@@ -92,6 +123,7 @@ function writeDeploymentFiles(): void {
   }
   // The empty root the include composes the patch layers over.
   volume.writeFile(`${DEPLOY_ROOT}/cordis.yml`, toBytes('[]\n'))
+  if (stale) volume.writeFile(SEED_MARKER, toBytes(`${SEED_REVISION}\n`))
 }
 
 /** Directories and stub binaries, created only when absent. */
@@ -172,4 +204,9 @@ Things that do not:
 export function seedFilesystem(): void {
   writeSkeleton()
   writeDeploymentFiles()
+  // A plugin that looks for the profile it belongs to finds this one.
+  declareProfileDirectory(SHIPPED_BUNDLES)
+  // The packages are seeded; this is the one piece of user state a default has
+  // to write, and it refuses to do so once the user has an opinion.
+  seedDefaultMarket()
 }

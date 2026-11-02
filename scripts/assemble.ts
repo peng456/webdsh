@@ -31,6 +31,15 @@ const generated = join(root, 'src', 'generated')
 /** Absolute VFS path the seeded deployment files land under. */
 const DEPLOY_ROOT = '/opt/dsh'
 
+/**
+ * Where the vendored plugin market lands in the virtual filesystem.
+ *
+ * It is the module root the plugin loader already searches for installed
+ * packages (`src/plugins/esm-loader.ts`), so the market resolves exactly as if
+ * the installer had put it there — no second lookup path, no special case.
+ */
+const DEPLOY_MARKET_ROOT = `${DEPLOY_ROOT}/plugins/node_modules`
+
 /** Short content hash used as a bundle revision, matching upstream's scheme. */
 function shortHash(input: Buffer | string): string {
   return createHash('sha1').update(input).digest('hex').slice(0, 12)
@@ -342,7 +351,56 @@ function emitSeed(): { files: [string, string][], specifiers: Set<string> } {
     console.warn('[assemble] @deepseek-ai/dsh is not installed; no agent presets will ship')
   }
 
+  // The default plugin market, unpacked by `npm run vendor:market`. Seeding it
+  // here rather than fetching it at boot is what makes it a default: present on
+  // the first page load, offline, and identical on every deployment of this
+  // build. `src/plugins/default-market.ts` adds the roster entry that mounts it.
+  const marketRoot = join(publicDir, 'market', 'vendor', 'node_modules')
+  const marketManifest = join(marketRoot, 'dsh-plugin-shop', 'package.json')
+  if (existsSync(marketManifest)) {
+    for (const name of ['dsh-plugin-shop', 'zod', 'yaml', 'semver', 'js-yaml']) {
+      const directory = join(marketRoot, name)
+      if (!existsSync(join(directory, 'package.json'))) {
+        throw new Error(`assemble: the vendored market is missing ${name}; run npm run vendor:market`)
+      }
+      for (const [path, contents] of collectBinaryTree(directory, `${DEPLOY_MARKET_ROOT}/${name}`)) {
+        files.push([path, contents])
+      }
+    }
+    const marketVersion = (JSON.parse(readFileSync(marketManifest, 'utf8')) as { version?: string }).version ?? 'unknown'
+    console.log(`[assemble] default plugin market dsh-plugin-shop@${marketVersion}`)
+  } else {
+    console.warn('[assemble] no vendored plugin market; this build ships without a default market')
+  }
+
   return { files, specifiers }
+}
+
+/**
+ * Walk one directory into `[path, base64]` pairs.
+ *
+ * Seed contents are strings, and a JS bundle or a `.wasm` does not survive a
+ * round-trip through UTF-8. The boot decodes a `b64:` prefix back to bytes, so
+ * the market's files arrive byte-exact while every text seed stays readable.
+ * @param directory - the directory to walk.
+ * @param prefix - the VFS path its contents land under.
+ * @returns the seed rows.
+ */
+function collectBinaryTree(directory: string, prefix: string): [string, string][] {
+  const out: [string, string][] = []
+  const walk = (from: string, to: string): void => {
+    for (const entry of readdirSync(from, { withFileTypes: true })) {
+      const source = join(from, entry.name)
+      const target = `${to}/${entry.name}`
+      if (entry.isDirectory()) {
+        walk(source, target)
+        continue
+      }
+      out.push([target, `b64:${readFileSync(source).toString('base64')}`])
+    }
+  }
+  walk(directory, prefix)
+  return out
 }
 
 /**
@@ -861,6 +919,16 @@ ${typertPackages.map(name => `  ${JSON.stringify(name)}: () => import(${JSON.str
 
 writeGenerated('seed-files.ts', `/** Deployment files seeded into the virtual filesystem at boot. */
 export const SEED_FILES: readonly (readonly [string, string])[] = ${JSON.stringify(files, null, 2)}
+
+/**
+ * Revision of the seed table above.
+ *
+ * The table is refreshed on every boot, which for this deployment means 1092
+ * files and ~10 MB of base64 in the vendored market, decoded and written into
+ * the virtual filesystem — and mirrored to IndexedDB — on every single open.
+ * The revision lets the boot skip that pass when nothing about it changed.
+ */
+export const SEED_REVISION = '${shortHash(JSON.stringify(files))}'
 `)
 
 console.log(`[assemble] ${String(clientRows.length)} client bundles`)

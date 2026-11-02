@@ -56,12 +56,36 @@ interface Roster {
   plugins: InstalledPlugin[]
 }
 
+/**
+ * Whether a roster entry still has the package it names on disk.
+ *
+ * The roster is user state and outlives builds. A build that no longer ships
+ * what an entry points at — this one stopped vendoring the market — would
+ * otherwise mount a layer and a client bundle that cannot resolve, and the
+ * page would greet the user with "failed to load plugins" for a plugin they
+ * never installed themselves.
+ */
+function stillInstalled(name: string): boolean {
+  return volume.exists(`${PLUGIN_MODULES_ROOT}/${name}/package.json`)
+}
+
+/** Drop roster entries whose package is no longer on disk. */
+function prune(roster: Roster): Roster {
+  const plugins = roster.plugins.filter(plugin => stillInstalled(plugin.name))
+  const dropped = roster.plugins.length - plugins.length
+  if (dropped > 0) {
+    console.warn(`[plugins] dropped ${String(dropped)} roster entries whose package is no longer in this build`)
+  }
+  return { ...roster, plugins }
+}
+
 /** Read the roster, tolerating a missing or corrupt file. */
+
 function readRoster(): Roster {
   if (!volume.exists(ROSTER_PATH)) return { plugins: [] }
   try {
     const parsed = JSON.parse(toText(volume.readFile(ROSTER_PATH))) as Roster
-    return Array.isArray(parsed.plugins) ? parsed : { plugins: [] }
+    return Array.isArray(parsed.plugins) ? prune(parsed) : { plugins: [] }
   } catch {
     return { plugins: [] }
   }
