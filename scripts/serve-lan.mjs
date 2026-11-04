@@ -25,7 +25,7 @@ import { networkInterfaces } from 'node:os'
 import { extname, join, normalize } from 'node:path'
 import { constants as zlibConstants, brotliCompressSync, gzipSync } from 'node:zlib'
 import { createSocket } from 'node:dgram'
-import { WebSocketServer } from 'ws'
+import { WebSocket, WebSocketServer } from 'ws'
 import { fileURLToPath } from 'node:url'
 
 // WEBSH_ROOT lets a second instance serve another build (A/B measurements).
@@ -87,6 +87,15 @@ const certPath = process.env.WEBSH_TLS_CERT
 const keyPath = process.env.WEBSH_TLS_KEY
 const handler = (req, res) => {
   const pathname = decodeURIComponent(new URL(req.url ?? '/', 'http://x').pathname)
+  // The registry, for peers that have no way to discover a page themselves.
+  if (pathname === '/__mesh/api/peers') {
+    const now = Date.now()
+    const entries = [...registry.values()].filter((entry) => now - entry.at < REGISTRY_TTL_MS)
+    const body = JSON.stringify({ ok: true, pages: entries.filter((e) => e.kind === 'page'), desktops: entries.filter((e) => e.kind === 'desktop') })
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'access-control-allow-origin': '*' })
+    res.end(body)
+    return
+  }
   let file = join(root, normalize(pathname).replace(/^(\.\.[/\\])+/, ''))
   const wantsDocument = (req.headers.accept ?? '').includes('text/html')
   // A directory that has an index is that page: `/webrtc/` is a page, not a
@@ -227,6 +236,34 @@ const scheme = tls === undefined ? 'http' : 'https'
  */
 const SIGNAL_PATH = '/__mesh/signal'
 const signalToken = process.env.WEBSH_SIGNAL_TOKEN ?? ''
+/**
+ * What the hub knows about the pages attached to it.
+ *
+ * A browser cannot be discovered: no multicast, no listening socket, no address
+ * anybody else could dial. So the one thing every page *can* reach — the server
+ * it was loaded from — keeps the list instead. Peers ask this on connect, which
+ * is why a page appears in a mesh at all.
+ *
+ * id → { id, machine, capabilities, kind, at }
+ */
+const registry = new Map()
+/** How long a silent registration is still shown; the socket closing removes it. */
+const REGISTRY_TTL_MS = 45_000
+
+/** Ports the tunnel may reach; a mesh peer listens on one port and that is all. */
+const TUNNEL_PORTS = new Set([Number(process.env.WEBSH_TUNNEL_PORT ?? 45917)])
+const TUNNEL_TOKEN = process.env.WEBSH_TUNNEL_TOKEN ?? signalToken
+
+/** Whether an address is on a private IPv4 range (or loopback). */
+function isPrivateAddress(address) {
+  const parts = String(address).split('.').map(Number)
+  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return false
+  if (parts[0] === 127) return true
+  if (parts[0] === 10) return true
+  if (parts[0] === 192 && parts[1] === 168) return true
+  if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true
+  return false
+}
 /** id → socket, for the pages currently attached. */
 const peers = new Map()
 let peerSeq = 0
@@ -253,6 +290,18 @@ signal.on('connection', (socket, request) => {
   socket.on('message', (raw) => {
     let message
     try { message = JSON.parse(String(raw)) } catch { return }
+    // A page announces itself once; that announcement is what `/__mesh/api/peers`
+    // answers with. `signal` frames stay a pure relay and are not recorded.
+    if (message?.type === 'hello') {
+      registry.set(id, {
+        id: message.id ?? id,
+        machine: String(message.machine ?? ''),
+        capabilities: message.capabilities ?? null,
+        kind: message.kind === 'desktop' ? 'desktop' : 'page',
+        at: Date.now(),
+      })
+      return
+    }
     if (message?.type !== 'signal') return
     const target = peers.get(message.to)
     if (target === undefined || target.readyState !== target.OPEN) return
@@ -260,6 +309,7 @@ signal.on('connection', (socket, request) => {
   })
   socket.on('close', () => {
     peers.delete(id)
+    registry.delete(id)
     broadcast({ type: 'leave', id })
   })
   socket.on('error', () => { socket.terminate(); peers.delete(id) })
@@ -307,10 +357,64 @@ function startStun() {
 
 startStun()
 
+/**
+ * The tunnel an https page uses to reach a plain-`ws` peer.
+ *
+ * A page served over https may only open `wss:` connections, and putting a
+ * certificate on every machine on the LAN is not a thing anyone wants to
+ * maintain. So the page dials its own origin — a wss the browser already trusts
+ * — and this server makes the last hop in plain WebSocket, on the private
+ * network, for one allowlisted port. The peer needs no change.
+ */
+const tunnel = new WebSocketServer({ noServer: true })
+
+tunnel.on('connection', (pageSocket, request) => {
+  const url = new URL(request.url ?? '/', 'http://x')
+  const target = url.searchParams.get('target') ?? ''
+  const [host, rawPort] = target.split(':')
+  const port = Number(rawPort ?? TUNNEL_PORTS.values().next().value)
+  const token = url.searchParams.get('t') ?? ''
+  const refuse = (reason) => {
+    try {
+      pageSocket.send(JSON.stringify({ type: 'error', error: reason }))
+      pageSocket.close(1008, reason)
+    } catch { /* 已关 */ }
+  }
+  if (TUNNEL_TOKEN !== '' && token !== TUNNEL_TOKEN) { refuse('bad token'); return }
+  if (!isPrivateAddress(host)) { refuse(`target ${host} is not a private address`); return }
+  if (!TUNNEL_PORTS.has(port)) { refuse(`port ${String(port)} is not allowed`); return }
+
+  const peerSocket = new WebSocket(`ws://${host}:${String(port)}/mesh/v1/ws`)
+  // A page announces itself immediately, and the first frame can arrive before
+  // the peer's TCP connection is up — buffering is the difference between a
+  // tunnel that works and one that swallows the handshake.
+  const pending = []
+  const forward = (from, to) => from.on('message', (data, isBinary) => {
+    if (to.readyState === to.OPEN) to.send(data, { binary: isBinary })
+    else pending.push([data, isBinary])
+  })
+  forward(pageSocket, peerSocket)
+  peerSocket.on('open', () => {
+    for (const [data, isBinary] of pending) peerSocket.send(data, { binary: isBinary })
+    pending.length = 0
+  })
+  forward(peerSocket, pageSocket)
+  peerSocket.on('close', () => { try { pageSocket.close() } catch { /* 已关 */ } })
+  peerSocket.on('error', (error) => refuse(`peer unreachable: ${error.message}`))
+  pageSocket.on('close', () => { try { peerSocket.close() } catch { /* 已关 */ } })
+})
+
 server.on('upgrade', (request, socket, head) => {
-  const pathname = new URL(request.url ?? '/', 'http://x').pathname
-  if (pathname !== SIGNAL_PATH) { socket.destroy(); return }
-  signal.handleUpgrade(request, socket, head, (client) => { signal.emit('connection', client, request) })
+  const url = new URL(request.url ?? '/', 'http://x')
+  if (url.pathname === SIGNAL_PATH) {
+    signal.handleUpgrade(request, socket, head, (client) => { signal.emit('connection', client, request) })
+    return
+  }
+  if (url.pathname === '/__mesh/tunnel') {
+    tunnel.handleUpgrade(request, socket, head, (client) => { tunnel.emit('connection', client, request) })
+    return
+  }
+  socket.destroy()
 })
 
 server.listen(port, host, () => {
