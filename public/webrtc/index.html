@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>webdsh WebRTC mesh — 局域网页面组网 PoC</title>
+  <style>
+    :root { color-scheme: light dark }
+    body { font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 0; padding: 16px; max-width: 980px }
+    h1 { font-size: 15px; margin: 0 0 4px }
+    .sub { opacity: .65; margin-bottom: 14px }
+    section { border: 1px solid color-mix(in srgb, currentColor 20%, transparent); border-radius: 8px; padding: 10px 12px; margin-bottom: 12px }
+    h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; opacity: .6; margin: 0 0 8px }
+    button { font: inherit; padding: 3px 10px; border-radius: 6px; border: 1px solid color-mix(in srgb, currentColor 30%, transparent); background: transparent; color: inherit; cursor: pointer }
+    button:hover { background: color-mix(in srgb, currentColor 10%, transparent) }
+    button:disabled { opacity: .4; cursor: default }
+    ul { list-style: none; padding: 0; margin: 0 }
+    li { display: flex; align-items: center; gap: 8px; padding: 3px 0 }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; opacity: .25 }
+    .dot.on { opacity: 1 }
+    pre { margin: 0; max-height: 260px; overflow: auto; white-space: pre-wrap; word-break: break-all }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px }
+  </style>
+</head>
+<body>
+  <h1>webdsh WebRTC mesh</h1>
+  <div class="sub">同一局域网、页面之间直连。信令走本机服务器 <code id="sig-url"></code>；数据走 WebRTC 数据通道。</div>
+
+  <section>
+    <h2>本机</h2>
+    <div class="row">实例 <code id="me">—</code> <span id="ws-state" class="dot"></span><span id="ws-text">未连接信令</span></div>
+    <div class="row">
+      <button id="auto">自动连接所有对端</button>
+      <button id="ping" disabled>ping</button>
+      <button id="bw" disabled>吞吐测试 (8 MiB)</button>
+      <button id="clear">清空日志</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>在线页面</h2>
+    <ul id="peers"><li style="opacity:.5">等待其他页面打开这个地址…</li></ul>
+  </section>
+
+  <section>
+    <h2>ICE 候选（看 mDNS 有没有在起作用）</h2>
+    <pre id="ice">—</pre>
+  </section>
+
+  <section>
+    <h2>日志</h2>
+    <pre id="log"></pre>
+  </section>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

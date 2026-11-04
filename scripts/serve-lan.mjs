@@ -24,6 +24,8 @@ import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs'
 import { networkInterfaces } from 'node:os'
 import { extname, join, normalize } from 'node:path'
 import { constants as zlibConstants, brotliCompressSync, gzipSync } from 'node:zlib'
+import { createSocket } from 'node:dgram'
+import { WebSocketServer } from 'ws'
 import { fileURLToPath } from 'node:url'
 
 // WEBSH_ROOT lets a second instance serve another build (A/B measurements).
@@ -87,6 +89,13 @@ const handler = (req, res) => {
   const pathname = decodeURIComponent(new URL(req.url ?? '/', 'http://x').pathname)
   let file = join(root, normalize(pathname).replace(/^(\.\.[/\\])+/, ''))
   const wantsDocument = (req.headers.accept ?? '').includes('text/html')
+  // A directory that has an index is that page: `/webrtc/` is a page, not a
+  // missing file, and answering it with the app's index.html would serve the
+  // harness where a test page was asked for.
+  if (existsSync(file) && statSync(file).isDirectory()) {
+    const index = join(file, 'index.html')
+    if (existsSync(index)) file = index
+  }
   if (!existsSync(file) || statSync(file).isDirectory()) {
     if (!wantsDocument) {
       res.writeHead(404, { ...isolation, 'cache-control': 'no-store' })
@@ -198,6 +207,112 @@ const tls = certPath !== undefined && keyPath !== undefined
 const server = tls === undefined ? createHttpServer(handler) : createHttpsServer(tls, handler)
 const scheme = tls === undefined ? 'http' : 'https'
 
+/**
+ * The signaling hub the page-to-page network borrows.
+ *
+ * WebRTC has no signaling of its own: two browsers cannot find each other, and
+ * every exchange of session descriptions has to travel over something that is
+ * not WebRTC. This server is already the one thing every page on the LAN can
+ * reach — they were loaded from it — so it is the natural place for that
+ * exchange, and it costs one upgrade route rather than a second service.
+ *
+ * It relays and nothing else: it never inspects an SDP, holds no state after a
+ * socket closes, and the media/data path afterwards is between the two pages.
+ *
+ * Protocol (JSON text frames):
+ *   server → client  {type:'welcome', id, peers:[id]}
+ *                    {type:'join', id} | {type:'leave', id}
+ *                    {type:'signal', from, data}
+ *   client → server  {type:'signal', to, data}
+ */
+const SIGNAL_PATH = '/__mesh/signal'
+const signalToken = process.env.WEBSH_SIGNAL_TOKEN ?? ''
+/** id → socket, for the pages currently attached. */
+const peers = new Map()
+let peerSeq = 0
+
+const signal = new WebSocketServer({ noServer: true })
+signal.on('connection', (socket, request) => {
+  const url = new URL(request.url ?? '/', 'http://x')
+  if (signalToken !== '' && url.searchParams.get('t') !== signalToken) {
+    socket.close(1008, 'bad token')
+    return
+  }
+  peerSeq += 1
+  const id = `p${String(peerSeq)}-${Math.random().toString(36).slice(2, 8)}`
+  peers.set(id, socket)
+  const broadcast = (message) => {
+    for (const [other, peer] of peers) {
+      if (other === id || peer.readyState !== peer.OPEN) continue
+      peer.send(JSON.stringify(message))
+    }
+  }
+  socket.send(JSON.stringify({ type: 'welcome', id, peers: [...peers.keys()].filter((other) => other !== id) }))
+  broadcast({ type: 'join', id })
+
+  socket.on('message', (raw) => {
+    let message
+    try { message = JSON.parse(String(raw)) } catch { return }
+    if (message?.type !== 'signal') return
+    const target = peers.get(message.to)
+    if (target === undefined || target.readyState !== target.OPEN) return
+    target.send(JSON.stringify({ type: 'signal', from: id, data: message.data }))
+  })
+  socket.on('close', () => {
+    peers.delete(id)
+    broadcast({ type: 'leave', id })
+  })
+  socket.on('error', () => { socket.terminate(); peers.delete(id) })
+})
+
+/**
+ * A STUN responder, because on this box the browser's own host candidates point
+ * at the proxy's TUN interface instead of the LAN.
+ *
+ * WebRTC needs *some* candidate that both ends can reach. Chrome picks its
+ * interfaces itself and, with a fake-IP tunnel in the routing table, the one it
+ * offers is the tunnel's address — which does not carry the traffic. A STUN
+ * server on the LAN makes the browser learn where it really is, and that
+ * candidate crosses the LAN. It answers Binding requests and nothing else
+ * (RFC 5389 §7.3), so it holds no state and stores no allocation.
+ */
+const STUN_PORT = Number(process.env.WEBSH_STUN_PORT ?? 3478)
+const MAGIC = 0x2112a442
+
+function startStun() {
+  const socket = createSocket('udp4')
+  socket.on('message', (message, rinfo) => {
+    if (message.length < 20 || message.readUInt16BE(0) !== 0x0001) return
+    if (message.readUInt32BE(4) !== MAGIC) return
+    const transaction = message.subarray(8, 20)
+    const address = rinfo.address.split('.').map(Number)
+    if (address.length !== 4) return
+    const attribute = Buffer.alloc(12)
+    attribute.writeUInt16BE(0x0020, 0) // XOR-MAPPED-ADDRESS
+    attribute.writeUInt16BE(8, 2)
+    attribute.writeUInt8(0, 4)
+    attribute.writeUInt8(0x01, 5) // IPv4
+    attribute.writeUInt16BE(rinfo.port ^ (MAGIC >>> 16), 6)
+    for (let i = 0; i < 4; i += 1) attribute.writeUInt8(address[i] ^ ((MAGIC >>> (24 - i * 8)) & 0xff), 8 + i)
+    const header = Buffer.alloc(20)
+    header.writeUInt16BE(0x0101, 0) // Binding success
+    header.writeUInt16BE(12, 2)
+    header.writeUInt32BE(MAGIC, 4)
+    transaction.copy(header, 8)
+    socket.send(Buffer.concat([header, attribute]), rinfo.port, rinfo.address)
+  })
+  socket.on('error', (error) => console.warn(`[stun] ${error.message}`))
+  socket.bind(STUN_PORT, '0.0.0.0', () => console.log(`  stun: stun:${networkInterfaces().en0?.[0]?.address ?? "127.0.0.1"}:${String(STUN_PORT)}`))
+}
+
+startStun()
+
+server.on('upgrade', (request, socket, head) => {
+  const pathname = new URL(request.url ?? '/', 'http://x').pathname
+  if (pathname !== SIGNAL_PATH) { socket.destroy(); return }
+  signal.handleUpgrade(request, socket, head, (client) => { signal.emit('connection', client, request) })
+})
+
 server.listen(port, host, () => {
   const addresses = Object.values(networkInterfaces())
     .flat()
@@ -205,4 +320,5 @@ server.listen(port, host, () => {
     .map((entry) => `${scheme}://${entry.address}:${String(port)}/`)
   console.log(`serving dist/ on ${scheme}://127.0.0.1:${String(port)}/ (bind ${host})`)
   for (const address of addresses) console.log(`  LAN: ${address}`)
+  console.log(`  signaling: ${scheme}://127.0.0.1:${String(port)}${SIGNAL_PATH}${signalToken === '' ? '' : ' (token required)'}`)
 })
