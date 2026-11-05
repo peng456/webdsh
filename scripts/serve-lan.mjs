@@ -86,8 +86,29 @@ const isolation = {
 const certPath = process.env.WEBSH_TLS_CERT
 const keyPath = process.env.WEBSH_TLS_KEY
 const handler = (req, res) => {
-  const pathname = decodeURIComponent(new URL(req.url ?? '/', 'http://x').pathname)
+  const requestUrl = new URL(req.url ?? '/', 'http://x')
+  const pathname = decodeURIComponent(requestUrl.pathname)
   // The registry, for peers that have no way to discover a page themselves.
+  if (pathname === '/__mesh/api/task') {
+    const target = requestUrl.searchParams.get('target') ?? ''
+    const chunks = []
+    req.on('data', (chunk) => chunks.push(chunk))
+    req.on('end', () => {
+      let body
+      try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')) } catch { body = undefined }
+      const answer = (status, payload) => {
+        res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'access-control-allow-origin': '*' })
+        res.end(JSON.stringify(payload))
+      }
+      if (target === '') { answer(400, { ok: false, error: 'target is required' }); return }
+      const method = req.headers['x-mesh-method'] ?? body?.method ?? 'POST'
+      const path = req.headers['x-mesh-path'] ?? body?.path ?? '/mesh/v1/task'
+      void askPage(target, { method, path, body: body?.body ?? body })
+        .then((result) => answer(result.status, safeJson(result.body)))
+        .catch((error) => answer(504, { ok: false, error: error.message }))
+    })
+    return
+  }
   if (pathname === '/__mesh/api/peers') {
     const now = Date.now()
     const entries = [...registry.values()].filter((entry) => now - entry.at < REGISTRY_TTL_MS)
@@ -234,7 +255,12 @@ const scheme = tls === undefined ? 'http' : 'https'
  *                    {type:'signal', from, data}
  *   client → server  {type:'signal', to, data}
  */
-const SIGNAL_PATH = '/__mesh/signal'
+/** Parse a page's answer body, or pass it through when it is not JSON. */
+function safeJson(text) {
+  try { return JSON.parse(text) } catch { return { ok: true, body: text } }
+}
+
+const SIGNAL_PATH = '/__mesh/signal' 
 const signalToken = process.env.WEBSH_SIGNAL_TOKEN ?? ''
 /**
  * What the hub knows about the pages attached to it.
@@ -300,6 +326,15 @@ signal.on('connection', (socket, request) => {
         kind: message.kind === 'desktop' ? 'desktop' : 'page',
         at: Date.now(),
       })
+      pageSockets.set(message.id ?? id, socket)
+      return
+    }
+    if (message?.type === 'answer') {
+      const waiting = pendingTasks.get(message.id)
+      if (waiting === undefined) return
+      clearTimeout(waiting.timer)
+      pendingTasks.delete(message.id)
+      waiting.resolve({ status: Number(message.status) || 200, body: String(message.body ?? '') })
       return
     }
     if (message?.type !== 'signal') return
@@ -308,6 +343,8 @@ signal.on('connection', (socket, request) => {
     target.send(JSON.stringify({ type: 'signal', from: id, data: message.data }))
   })
   socket.on('close', () => {
+    const entry = registry.get(id)
+    if (entry !== undefined) pageSockets.delete(entry.id)
     peers.delete(id)
     registry.delete(id)
     broadcast({ type: 'leave', id })
@@ -403,6 +440,38 @@ tunnel.on('connection', (pageSocket, request) => {
   peerSocket.on('error', (error) => refuse(`peer unreachable: ${error.message}`))
   pageSocket.on('close', () => { try { peerSocket.close() } catch { /* 已关 */ } })
 })
+
+/**
+ * Tasks addressed to a page, relayed through the hub.
+ *
+ * A page cannot be posted to: it has no listening socket, and the connection it
+ * holds is outbound. So the hub keeps that connection and turns an HTTP POST
+ * from any peer into a frame on it, then turns the page's answer back into the
+ * HTTP response. The caller sees an ordinary request; the page sees an ordinary
+ * task.
+ *
+ * Two directions, one endpoint: `?target=<pageId>` with a body shaped like
+ * `/mesh/v1/task` (or `/mesh/v1/health`, or anything else — the page routes it
+ * through its own handler).
+ */
+const pendingTasks = new Map()
+let taskSeq = 0
+
+/** pageId → the socket that page is attached on. */
+const pageSockets = new Map()
+
+/** Ask one attached page to handle a request; resolves with its answer. */
+function askPage(pageId, payload, timeoutMs = 120_000) {
+  return new Promise((resolve, reject) => {
+    const socket = pageSockets.get(pageId)
+    if (socket === undefined || socket.readyState !== socket.OPEN) { reject(new Error(`page ${pageId} is not attached`)); return }
+    taskSeq += 1
+    const id = `h${String(taskSeq)}`
+    const timer = setTimeout(() => { pendingTasks.delete(id); reject(new Error('page did not answer')) }, timeoutMs)
+    pendingTasks.set(id, { resolve, reject, timer })
+    socket.send(JSON.stringify({ type: 'request', id, ...payload }))
+  })
+}
 
 server.on('upgrade', (request, socket, head) => {
   const url = new URL(request.url ?? '/', 'http://x')
