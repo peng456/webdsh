@@ -9,9 +9,9 @@
     "node": ">=22"
   },
   "scripts": {
-    "assemble": "node scripts/vendor-vivari.mjs && npm run build:plugins && npm run build:shell && npm run build:python && npm run build:v86 && npm run build:browser && tsx scripts/assemble.ts",
+    "assemble": "npm run build:plugins && npm run build:shell && npm run build:python && npm run build:v86 && npm run build:browser && tsx scripts/assemble.ts",
     "dev": "npm run assemble && vite",
-    "build": "npm run assemble && vite build",
+    "build": "npm run assemble && vite build && node scripts/fix-subpath.mjs",
     "preview": "vite preview --port 4173",
     "refresh:models": "tsx scripts/refresh-free-routes.ts",
     "test": "tsx scripts/e2e.ts",
