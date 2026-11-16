@@ -171,6 +171,10 @@ async function main(): Promise<void> {
     // client-side boot against the manifest published above.
     await import(/* @vite-ignore */ new URL(SHELL_ENTRY, document.baseURI).href)
     progress.done()
+    // The page network rides on the same boot: one outbound socket to the hub,
+    // opened once the shell is up so it shares the environment every other
+    // client module was created in.
+    void import('./hub-client.ts')
   } catch (error) {
     console.error('[dsh-web] boot failed:', error)
     renderBootFailure(error, await bootRecoveries())

@@ -34,7 +34,10 @@ for (const name of readdirSync(assets)) {
   const before = readFileSync(path, 'utf8')
   // `/assets/kernel-worker-x.js` → `./kernel-worker-x.js`, resolved against the
   // bundle's own URL, which is where the file actually sits.
-  let after = before.replace(/"\/assets\/(kernel-worker-[A-Za-z0-9_-]+\.js)"/g, '"./$1"')
+  // Every worker the kernel starts is named the same way, and each is copied
+  // into `assets/` beside the kernel — so the whole family becomes relative, not
+  // just the kernel itself. (A project path breaks all of them identically.)
+  let after = before.replace(/"\/assets\/([A-Za-z0-9_.-]+\.(?:js|wasm))"/g, '"./$1"')
   // The kernel's vendor asset lookup: origin-absolute → worker-relative.
   after = after.replace(
     /return \(self\.location && self\.location\.origin \|\| ""\) \+ \(typeof import\.meta !== "undefined" && "\/" \|\| "\/"\) \+ name;/g,
